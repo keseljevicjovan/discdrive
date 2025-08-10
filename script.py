@@ -17,29 +17,106 @@ MAX_MESSAGES_TO_FETCH = 100
 def clean_filename_part(filename):
     return re.sub(r"\.part\d+$", "", filename)
 
+def fetch_messages_sync(limit=100):
+    url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages"
+    headers = {"Authorization": f"Bot {TOKEN}"}
+    messages = []
+    last_id = None
+
+    while len(messages) < limit:
+        batch_limit = min(100, limit - len(messages))
+        params = {"limit": str(batch_limit)}
+        if last_id:
+            params["before"] = last_id
+        r = requests.get(url, headers=headers, params=params)
+        if r.status_code == 200:
+            batch = r.json()
+            if not batch:
+                break
+            messages.extend(batch)
+            last_id = batch[-1]["id"]
+        else:
+            print(f"Error fetching messages: {r.status_code} - {r.text}")
+            break
+    return messages[:limit]
+
+def get_uploaded_parts_sync(base_filename):
+    messages = fetch_messages_sync(limit=MAX_MESSAGES_TO_FETCH)
+    existing_parts = set()
+    for msg in messages:
+        for att in msg.get("attachments", []):
+            fname = att["filename"]
+            if fname.startswith(base_filename) and re.search(r"\.part\d+$", fname):
+                existing_parts.add(fname)
+    return existing_parts
+
 def upload_sync(path):
     if not os.path.isfile(path):
         print(f"File '{path}' does not exist.")
         return
+
+    base_filename = os.path.basename(path)
+    existing_parts = get_uploaded_parts_sync(base_filename)
+
     url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages"
     headers = {"Authorization": f"Bot {TOKEN}"}
-    part = 1
+
     file_size = os.path.getsize(path)
     total_parts = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+
     with open(path, "rb") as f, tqdm(total=total_parts, desc="Uploading", unit="part") as pbar:
+        part = 1
         while True:
             chunk = f.read(CHUNK_SIZE)
             if not chunk:
                 break
-            filename = f"{os.path.basename(path)}.part{part}"
-            files = {"file": (filename, chunk)}
-            r = requests.post(url, headers=headers, files=files)
-            if r.status_code == 200:
+            filename = f"{base_filename}.part{part}"
+            if filename in existing_parts:
                 pbar.update(1)
+                print(f"Skipping already uploaded part {part}")
             else:
-                print(f"\nError on part {part}: {r.status_code} - {r.text}")
-                break
+                files = {"file": (filename, chunk)}
+                r = requests.post(url, headers=headers, files=files)
+                if r.status_code == 200:
+                    pbar.update(1)
+                else:
+                    print(f"\nError on part {part}: {r.status_code} - {r.text}")
+                    break
             part += 1
+
+async def fetch_messages(session, limit=100):
+    url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages"
+    headers = {"Authorization": f"Bot {TOKEN}"}
+    messages = []
+    last_id = None
+
+    while len(messages) < limit:
+        batch_limit = min(100, limit - len(messages))
+        params = {"limit": str(batch_limit)}
+        if last_id:
+            params["before"] = last_id
+        async with session.get(url, headers=headers, params=params) as resp:
+            if resp.status == 200:
+                batch = await resp.json()
+                if not batch:
+                    break
+                messages.extend(batch)
+                last_id = batch[-1]["id"]
+            else:
+                text = await resp.text()
+                print(f"Error fetching messages: {resp.status} - {text}")
+                break
+    return messages[:limit]
+
+async def get_uploaded_parts(session, base_filename):
+    messages = await fetch_messages(session, limit=MAX_MESSAGES_TO_FETCH)
+    existing_parts = set()
+    for msg in messages:
+        for att in msg.get("attachments", []):
+            fname = att["filename"]
+            if fname.startswith(base_filename) and re.search(r"\.part\d+$", fname):
+                existing_parts.add(fname)
+    return existing_parts
 
 async def upload_chunk(session, path, chunk, part, pbar, semaphore):
     url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages"
@@ -75,46 +152,34 @@ async def upload_async(path):
     if not os.path.isfile(path):
         print(f"File '{path}' does not exist.")
         return
+
+    base_filename = os.path.basename(path)
     file_size = os.path.getsize(path)
     total_parts = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
+
     async with aiohttp.ClientSession() as session:
+        existing_parts = await get_uploaded_parts(session, base_filename)
+
         part = 1
         tasks = []
         pbar = tqdm(total=total_parts, desc="Uploading", unit="part")
+
         with open(path, "rb") as f:
             while True:
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
                     break
-                tasks.append(upload_chunk(session, path, chunk, part, pbar, semaphore))
+                filename = f"{base_filename}.part{part}"
+                if filename in existing_parts:
+                    pbar.update(1)
+                    print(f"Skipping already uploaded part {part}")
+                else:
+                    tasks.append(upload_chunk(session, path, chunk, part, pbar, semaphore))
                 part += 1
-        await asyncio.gather(*tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
         pbar.close()
-
-async def fetch_messages(session, limit=100):
-    url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages"
-    headers = {"Authorization": f"Bot {TOKEN}"}
-    messages = []
-    last_id = None
-
-    while len(messages) < limit:
-        batch_limit = min(100, limit - len(messages))
-        params = {"limit": str(batch_limit)}
-        if last_id:
-            params["before"] = last_id
-        async with session.get(url, headers=headers, params=params) as resp:
-            if resp.status == 200:
-                batch = await resp.json()
-                if not batch:
-                    break
-                messages.extend(batch)
-                last_id = batch[-1]["id"]
-            else:
-                text = await resp.text()
-                print(f"Error fetching messages: {resp.status} - {text}")
-                break
-    return messages[:limit]
 
 def sizeof_fmt(num, suffix="B"):
     for unit in ["", "K", "M", "G", "T"]:
@@ -249,3 +314,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
