@@ -46,7 +46,7 @@ def get_uploaded_parts_sync(base_filename):
     for msg in messages:
         for att in msg.get("attachments", []):
             fname = att["filename"]
-            if fname.startswith(base_filename) and re.search(r"\.part\d+$", fname):
+            if fname == base_filename or (fname.startswith(base_filename) and re.search(r"\.part\d+$", fname)):
                 existing_parts.add(fname)
     return existing_parts
 
@@ -63,6 +63,19 @@ def upload_sync(path):
 
     file_size = os.path.getsize(path)
     total_parts = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+    if total_parts == 1:
+        if base_filename in existing_parts:
+            print(f"File '{base_filename}' already uploaded, skipping.")
+            return
+        with open(path, "rb") as f, tqdm(total=1, desc="Uploading", unit="file") as pbar:
+            files = {"file": (base_filename, f)}
+            r = requests.post(url, headers=headers, files=files)
+            if r.status_code == 200:
+                pbar.update(1)
+            else:
+                print(f"\nError uploading file: {r.status_code} - {r.text}")
+        return
 
     with open(path, "rb") as f, tqdm(total=total_parts, desc="Uploading", unit="part") as pbar:
         part = 1
@@ -114,14 +127,19 @@ async def get_uploaded_parts(session, base_filename):
     for msg in messages:
         for att in msg.get("attachments", []):
             fname = att["filename"]
-            if fname.startswith(base_filename) and re.search(r"\.part\d+$", fname):
+            if fname == base_filename or (fname.startswith(base_filename) and re.search(r"\.part\d+$", fname)):
                 existing_parts.add(fname)
     return existing_parts
 
-async def upload_chunk(session, path, chunk, part, pbar, semaphore):
+async def upload_chunk(session, path, part, offset, size, pbar, semaphore):
     url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages"
     headers = {"Authorization": f"Bot {TOKEN}"}
     filename = f"{os.path.basename(path)}.part{part}"
+
+    with open(path, "rb") as f:
+        f.seek(offset)
+        chunk = f.read(size)
+
     data = aiohttp.FormData()
     data.add_field("file", chunk, filename=filename)
 
@@ -161,22 +179,40 @@ async def upload_async(path):
     async with aiohttp.ClientSession() as session:
         existing_parts = await get_uploaded_parts(session, base_filename)
 
-        part = 1
-        tasks = []
-        pbar = tqdm(total=total_parts, desc="Uploading", unit="part")
+        if total_parts == 1:
+            if base_filename in existing_parts:
+                print(f"File '{base_filename}' already uploaded, skipping.")
+                return
+            pbar = tqdm(total=1, desc="Uploading", unit="file")
+            with open(path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("file", f, filename=base_filename)
+                async with semaphore:
+                    async with session.post(f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages",
+                                            headers={"Authorization": f"Bot {TOKEN}"},
+                                            data=data) as resp:
+                        if resp.status == 200:
+                            pbar.update(1)
+                        else:
+                            text = await resp.text()
+                            print(f"\nError uploading file: {resp.status} - {text}")
+            pbar.close()
+            return
 
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                filename = f"{base_filename}.part{part}"
-                if filename in existing_parts:
-                    pbar.update(1)
-                    print(f"Skipping already uploaded part {part}")
-                else:
-                    tasks.append(upload_chunk(session, path, chunk, part, pbar, semaphore))
-                part += 1
+        pbar = tqdm(total=total_parts, desc="Uploading", unit="part")
+        tasks = []
+
+        for part in range(1, total_parts + 1):
+            filename = f"{base_filename}.part{part}"
+            if filename in existing_parts:
+                pbar.update(1)
+                print(f"Skipping already uploaded part {part}")
+                continue
+
+            offset = (part - 1) * CHUNK_SIZE
+            size = min(CHUNK_SIZE, file_size - offset)
+            tasks.append(upload_chunk(session, path, part, offset, size, pbar, semaphore))
+
         if tasks:
             await asyncio.gather(*tasks)
         pbar.close()
@@ -193,6 +229,7 @@ async def list_files():
         messages = await fetch_messages(session, limit=MAX_MESSAGES_TO_FETCH)
         files_map = {}
         files_size = {}
+
         for msg in messages:
             for att in msg.get("attachments", []):
                 base_name = clean_filename_part(att["filename"])
@@ -207,7 +244,10 @@ async def list_files():
         print("Files found:")
         for fname, count in files_map.items():
             size_str = sizeof_fmt(files_size.get(fname, 0))
-            print(f"- {fname} ({count} parts, {size_str})")
+            if count == 1:
+                print(f"- {fname} ({size_str})")
+            else:
+                print(f"- {fname} ({count} parts, {size_str})")
 
 async def download_file(file_name):
     async with aiohttp.ClientSession() as session:
@@ -215,12 +255,18 @@ async def download_file(file_name):
         parts = []
         for msg in messages:
             for att in msg.get("attachments", []):
-                if clean_filename_part(att["filename"]) == file_name:
+                if att["filename"] == file_name or clean_filename_part(att["filename"]) == file_name:
                     parts.append((att["filename"], att["url"]))
+
         if not parts:
             print(f"No parts found for file '{file_name}'")
             return
-        parts.sort(key=lambda x: int(re.search(r"\.part(\d+)$", x[0]).group(1)) if re.search(r"\.part(\d+)$", x[0]) else 0)
+
+        def part_key(t):
+            match = re.search(r"\.part(\d+)$", t[0])
+            return int(match.group(1)) if match else 0
+        parts.sort(key=part_key)
+
         out_file = file_name
         with open(out_file, "wb") as f, tqdm(total=len(parts), desc="Downloading", unit="part") as pbar:
             for fname, url in parts:
@@ -241,7 +287,7 @@ async def delete_file(file_name):
         to_delete = []
         for msg in messages:
             for att in msg.get("attachments", []):
-                if clean_filename_part(att["filename"]) == file_name:
+                if att["filename"] == file_name or clean_filename_part(att["filename"]) == file_name:
                     to_delete.append(msg["id"])
 
         if not to_delete:
@@ -314,4 +360,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
